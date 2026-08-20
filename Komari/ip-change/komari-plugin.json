@@ -1,0 +1,60 @@
+{
+  "$schema": "./node_modules/@komari-monitor/plugin-sdk/schema/komari-plugin.schema.json",
+  "name": {
+    "zh-CN": "出口 IP 变化通知",
+    "en": "Public IP Change Notifier"
+  },
+  "short": "ip-change",
+  "description": {
+    "zh-CN": "检测 Komari 节点出口公网 IP 变化，并按自定义模板发送通知。",
+    "en": "Detect public IP changes reported by Komari nodes and send notifications using a custom template."
+  },
+  "author": "穿云箭",
+  "version": "0.1.4",
+  "komari": ">=1.4.3",
+  "entry": "script.js",
+  "permissions": {
+    "node": true,
+    "allowSystemRPC": true,
+    "allowRoutes": true,
+    "maxHTTPBodyBytes": 65536,
+    "timeout": 30
+  },
+  "configuration": {
+    "type": "managed",
+    "data": [
+      {
+        "key": "interval",
+        "name": { "zh-CN": "检查间隔（分钟）", "en": "Check interval (minutes)" },
+        "type": "number",
+        "default": 5,
+        "required": true
+      },
+      {
+        "key": "nodes",
+        "name": { "zh-CN": "监控节点", "en": "Nodes to monitor" },
+        "type": "nodes",
+        "help": {
+          "zh-CN": "留空时监控全部节点；只比较节点上报的 IPv4/IPv6 地址。",
+          "en": "Leave empty to monitor all nodes. The reported IPv4 and IPv6 addresses are compared."
+        }
+      },
+      {
+        "key": "notify",
+        "name": { "zh-CN": "发生变化时发送通知", "en": "Notify on change" },
+        "type": "switch",
+        "default": true
+      },
+      {
+        "key": "template",
+        "name": { "zh-CN": "通知模板", "en": "Notification template" },
+        "type": "richtext",
+        "default": "出口 IP 发生变化：{{node}} {{ip_version}} {{old_ip}} -> {{new_ip}}",
+        "help": {
+          "zh-CN": "使用双大括号占位符：{{node}}、{{node_id}}、{{old_ip}}、{{new_ip}}、{{ip_version}}、{{time}}。",
+          "en": "Use double-brace placeholders: {{node}}, {{node_id}}, {{old_ip}}, {{new_ip}}, {{ip_version}}, {{time}}."
+        }
+      }
+    ]
+  }
+}

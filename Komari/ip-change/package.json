@@ -1,0 +1,24 @@
+{
+  "name": "komari-plugin-ip-change",
+  "version": "0.1.4",
+  "private": true,
+  "description": "Komari plugin that notifies when a node's reported public IP changes",
+  "scripts": {
+    "check": "komari-plugin-dev check",
+    "build": "komari-plugin-dev build",
+    "pack": "komari-plugin-dev build && komari-plugin-dev pack && node scripts/rename-pack.js",
+    "typecheck": "tsc --noEmit",
+    "plugin:install": "komari-plugin-dev install --enable",
+    "dev": "komari-plugin-dev dev"
+  },
+  "komari": {
+    "source": "src/plugin.ts"
+  },
+  "dependencies": {
+    "@komari-monitor/plugin-sdk": "^1.4.3"
+  },
+  "devDependencies": {
+    "@komari-monitor/plugin-dev": "^1.4.3",
+    "typescript": "^5.0.0"
+  }
+}
