@@ -9,6 +9,9 @@ interface PluginConfig {
   notify?: boolean;
   template?: string;
   nodes?: string[] | string;
+  // Number of consecutive checks that must report the same new IP before it
+  // is accepted as a real change (debounce against DNS-unlock flapping).
+  confirm_count?: number;
 }
 
 interface IpState {
@@ -18,6 +21,10 @@ interface IpState {
   last_ip: string;
   last_checked_at: string;
   last_changed_at?: string;
+  // Pending candidate IP that differs from last_ip but has not been observed
+  // enough consecutive times yet.
+  pending_ip?: string;
+  pending_count?: number;
 }
 
 interface IpChange {
@@ -30,6 +37,7 @@ interface IpChange {
 const STORAGE_FILE = path.join(__storageDir__, "state.json");
 const DEFAULT_TEMPLATE = "出口 IP 发生变化：{{node}} {{ip_version}} {{old_ip}} -> {{new_ip}}";
 const DEFAULT_INTERVAL = 5;
+const DEFAULT_CONFIRM_COUNT = 2;
 
 function loadState(): Record<string, IpState> {
   try {
@@ -127,6 +135,7 @@ async function checkOnce(): Promise<Record<string, any>> {
   const state = loadState();
   const changes: IpChange[] = [];
   const checkedAt = new Date().toISOString();
+  const confirmCount = Math.max(1, Math.floor(Number(config.confirm_count) || DEFAULT_CONFIRM_COUNT));
   let checked = 0;
 
   for (const { uuid, node } of nodeEntries(nodes)) {
@@ -143,12 +152,27 @@ async function checkOnce(): Promise<Record<string, any>> {
         node_uuid: uuid,
         node_name: String(node && (node.name || node.hostname) || uuid),
         ip_version: version,
-        last_ip: ip,
+        last_ip: previous?.last_ip || ip,
         last_checked_at: checkedAt,
-        last_changed_at: previous && previous.last_ip !== ip ? checkedAt : previous?.last_changed_at,
+        last_changed_at: previous?.last_changed_at,
       };
-      if (previous && previous.last_ip && previous.last_ip !== ip) {
-        changes.push({ node: { ...node, uuid }, version, oldIp: previous.last_ip, newIp: ip });
+      if (!previous || !previous.last_ip || ip === previous.last_ip) {
+        // First sighting or same IP: accept immediately and clear any pending
+        // candidate (the flap resolved itself back to the recorded IP).
+        entry.last_ip = ip;
+        if (!previous || !previous.last_ip) entry.last_changed_at = checkedAt;
+      } else if (ip !== previous.last_ip) {
+        // Candidate differs from the recorded IP: require it to be seen
+        // confirm_count consecutive times before accepting it as a change.
+        const pendingCount = previous.pending_ip === ip ? (previous.pending_count || 0) + 1 : 1;
+        if (pendingCount >= confirmCount) {
+          entry.last_ip = ip;
+          entry.last_changed_at = checkedAt;
+          changes.push({ node: { ...node, uuid }, version, oldIp: previous.last_ip, newIp: ip });
+        } else {
+          entry.pending_ip = ip;
+          entry.pending_count = pendingCount;
+        }
       }
       state[key] = entry;
     }

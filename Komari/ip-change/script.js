@@ -445,6 +445,7 @@
   var STORAGE_FILE = path.join(__storageDir__, "state.json");
   var DEFAULT_TEMPLATE = "\u51FA\u53E3 IP \u53D1\u751F\u53D8\u5316\uFF1A{{node}} {{ip_version}} {{old_ip}} -> {{new_ip}}";
   var DEFAULT_INTERVAL = 5;
+  var DEFAULT_CONFIRM_COUNT = 2;
   function loadState() {
     try {
       if (!fs.existsSync(STORAGE_FILE)) return {};
@@ -523,6 +524,7 @@
     const state = loadState();
     const changes = [];
     const checkedAt = (/* @__PURE__ */ new Date()).toISOString();
+    const confirmCount = Math.max(1, Math.floor(Number(config.confirm_count) || DEFAULT_CONFIRM_COUNT));
     let checked = 0;
     for (const { uuid, node } of nodeEntries(nodes)) {
       if (selected && !selected.has(uuid)) continue;
@@ -536,12 +538,23 @@
           node_uuid: uuid,
           node_name: String(node && (node.name || node.hostname) || uuid),
           ip_version: version,
-          last_ip: ip,
+          last_ip: previous?.last_ip || ip,
           last_checked_at: checkedAt,
-          last_changed_at: previous && previous.last_ip !== ip ? checkedAt : previous?.last_changed_at
+          last_changed_at: previous?.last_changed_at
         };
-        if (previous && previous.last_ip && previous.last_ip !== ip) {
-          changes.push({ node: { ...node, uuid }, version, oldIp: previous.last_ip, newIp: ip });
+        if (!previous || !previous.last_ip || ip === previous.last_ip) {
+          entry.last_ip = ip;
+          if (!previous || !previous.last_ip) entry.last_changed_at = checkedAt;
+        } else if (ip !== previous.last_ip) {
+          const pendingCount = previous.pending_ip === ip ? (previous.pending_count || 0) + 1 : 1;
+          if (pendingCount >= confirmCount) {
+            entry.last_ip = ip;
+            entry.last_changed_at = checkedAt;
+            changes.push({ node: { ...node, uuid }, version, oldIp: previous.last_ip, newIp: ip });
+          } else {
+            entry.pending_ip = ip;
+            entry.pending_count = pendingCount;
+          }
         }
         state[key] = entry;
       }

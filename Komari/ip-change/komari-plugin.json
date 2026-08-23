@@ -10,7 +10,7 @@
     "en": "Detect public IP changes reported by Komari nodes and send notifications using a custom template."
   },
   "author": "穿云箭",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "komari": ">=1.4.3",
   "entry": "script.js",
   "permissions": {
@@ -37,6 +37,16 @@
         "help": {
           "zh-CN": "留空时监控全部节点；只比较节点上报的 IPv4/IPv6 地址。",
           "en": "Leave empty to monitor all nodes. The reported IPv4 and IPv6 addresses are compared."
+        }
+      },
+      {
+        "key": "confirm_count",
+        "name": { "zh-CN": "确认次数（防抖）", "en": "Confirm count (debounce)" },
+        "type": "number",
+        "default": 2,
+        "help": {
+          "zh-CN": "新 IP 需连续出现这么多次才确认为真实变化，用于过滤 DNS 解锁导致的偶发错误 IP。",
+          "en": "A new IP must be seen this many consecutive checks before it is treated as a real change, filtering occasional wrong IPs caused by DNS unlocking."
         }
       },
       {

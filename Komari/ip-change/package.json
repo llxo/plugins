@@ -1,6 +1,6 @@
 {
   "name": "komari-plugin-ip-change",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "private": true,
   "description": "Komari plugin that notifies when a node's reported public IP changes",
   "scripts": {
