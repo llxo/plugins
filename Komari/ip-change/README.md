@@ -4,7 +4,7 @@
 
 插件按设定间隔读取 Komari 节点上报的公网 IPv4/IPv6 地址，保存上次结果。地址发生变化时发送一条 Komari 通知
 
-当前版本 0.1.5 可在 [Komari/dist](https://github.com/llxo/plugins/tree/master/Komari/dist) 下载
+当前版本 0.1.5 可在 [Komari/dist](https://github.com/llxo/plugins/tree/main/Komari/dist) 下载
 
 ## 配置
 
