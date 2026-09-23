@@ -3586,7 +3586,7 @@ DNS.2 = *.${domain}
 EOF
 
     # 使用 RSA 2048 生成证书 (CF 回源兼容性更佳)
-    openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 3650 \
+    openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 365 \
         -keyout "$key_path" -out "$cert_path" \
         -config "$openssl_config" >/dev/null 2>&1
     
