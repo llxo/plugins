@@ -1489,9 +1489,22 @@ _write_singbox_core_lock() {
 }
 
 _install_sing_box() {
-    local requested_version="${1:-$SINGBOX_FIXED_VERSION}"
-    local api_url="https://api.github.com/repos/SagerNet/sing-box/releases/tags/v${SINGBOX_FIXED_VERSION}"
-    local requested_label="固定版 v${SINGBOX_FIXED_VERSION}"
+    local requested_version="${1:-latest}"
+    local api_url requested_label
+    case "$requested_version" in
+        latest)
+            api_url="https://api.github.com/repos/SagerNet/sing-box/releases/latest"
+            requested_label="最新稳定版"
+            ;;
+        "$SINGBOX_FIXED_VERSION")
+            api_url="https://api.github.com/repos/SagerNet/sing-box/releases/tags/v${SINGBOX_FIXED_VERSION}"
+            requested_label="固定版 v${SINGBOX_FIXED_VERSION}"
+            ;;
+        *)
+            _error "不允许安装未授权的 sing-box 版本: ${requested_version}"
+            return 1
+            ;;
+    esac
     _info "正在安装 ${requested_label} sing-box..."
     local arch=$(uname -m)
     local arch_tag
@@ -1531,8 +1544,8 @@ _install_sing_box() {
         return 1
     fi
     release_version="${release_tag#v}"
-    if [ "$release_version" != "$SINGBOX_FIXED_VERSION" ]; then
-        _error "固定版响应不匹配：请求 v${SINGBOX_FIXED_VERSION}，实际为 ${release_tag}。"
+    if [ "$requested_version" != "latest" ] && [ "$release_version" != "$requested_version" ]; then
+        _error "固定版响应不匹配：请求 v${requested_version}，实际为 ${release_tag}。"
         return 1
     fi
     if [ "$asset_count" != "1" ]; then
@@ -3664,7 +3677,10 @@ _show_node_link() {
         "anytls")
             # 参数: password, sni, skip_verify
             local password="$1" sni="${2:-$DEFAULT_SNI}" skip_verify="$3" cert_path="$4"
-            local insecure_param=$(_tls_insecure_params "$skip_verify" "$cert_path")
+            local insecure_param=""
+            if [ "$skip_verify" = "true" ]; then
+                insecure_param="&insecure=1"
+            fi
             url="anytls://${password}@${link_ip}:${port}?security=tls&sni=${sni}${insecure_param}#$(_url_encode "$name")"
             ;;
         "any-reality")
@@ -4403,13 +4419,13 @@ _create_anytls_tls_node() {
     local link_ip="$node_ip"
     [[ "$node_ip" == *":"* ]] && link_ip="[$node_ip]"
     
-    # --- 生成 Inbound 配置 (包含 padding_scheme) ---
-    # padding_scheme 是 AnyTLS 的核心功能，用于流量填充对抗检测
+    # --- 生成 Inbound 配置 ---
+    # padding_scheme 设为空数组以启用 sing-box 1.14+ 内置的标准 8 阶段填充方案
+    # tls 块不指定 alpn 以支持任意客户端 ALPN 协商
     local inbound_json=$(jq -n \
         --arg t "$tag" \
         --arg p "$port" \
         --arg pw "$password" \
-        --arg sn "$server_name" \
         --arg cp "$cert_path" \
         --arg kp "$key_path" \
         '{
@@ -4418,14 +4434,9 @@ _create_anytls_tls_node() {
             "listen": "::",
             "listen_port": ($p|tonumber),
             "users": [{"name": "default", "password": $pw}],
-            "padding_scheme": [
-                "stop=2",
-                "0=100-200",
-                "1=100-200"
-            ],
+            "padding_scheme": [],
             "tls": {
                 "enabled": true,
-                "alpn": ["http/1.1"],
                 "certificate_path": $cp,
                 "key_path": $kp
             }
@@ -7233,46 +7244,81 @@ _require_singbox() {
     return 0
 }
 
-# [安装 Sing-box 核心] — 固定安装 v1.13.21，无升级检查
+# [安装/更新 Sing-box 核心] — 支持安装最新稳定版与固定版
 _install_singbox() {
     local current_ver="未安装" confirm
     if [ -f "${SINGBOX_BIN}" ]; then
         current_ver=$(${SINGBOX_BIN} version 2>/dev/null | head -n1 | awk '{print $3}')
+        current_ver="${current_ver#v}"
         [ -n "$current_ver" ] || current_ver="未知"
     fi
 
     clear
     echo -e "${CYAN}"
     echo '  ╔═══════════════════════════════════════╗'
-    echo '  ║          安装 Sing-box 核心           ║'
+    echo '  ║       安装/更新 Sing-box 核心         ║'
     echo '  ╚═══════════════════════════════════════╝'
     echo -e "${NC}"
     if [ "$current_ver" = "未安装" ]; then
-        echo -e "  当前状态: ${YELLOW}未安装${NC}"
-        echo -e "  固定版本: ${GREEN}v${SINGBOX_FIXED_VERSION}${NC}"
-        echo ""
-        read -r -p "  是否安装 Sing-box 核心 v${SINGBOX_FIXED_VERSION}？(Y/n): " confirm
-        [[ "$confirm" =~ ^[Nn]$ ]] && return 0
-        _do_install_singbox
+        echo -e "  当前版本: ${YELLOW}未安装${NC}"
     else
         echo -e "  当前版本: ${GREEN}v${current_ver}${NC}"
-        echo -e "  固定版本: ${GREEN}v${SINGBOX_FIXED_VERSION}${NC}"
-        echo ""
-        _info "Sing-box 核心已安装，当前版本无需更新。"
-        read -r -p "  是否重新安装固定版核心？(y/N): " confirm
-        [[ "$confirm" =~ ^[Yy]$ ]] || return 0
-        _do_install_singbox
     fi
+
+    if _singbox_core_is_locked; then
+        echo -e "  版本策略: ${YELLOW}固定 v${SINGBOX_FIXED_VERSION}（禁止升级）${NC}"
+        if [ "$current_ver" != "$SINGBOX_FIXED_VERSION" ]; then
+            _warn "检测到固定锁与当前核心版本不一致，请选择 [2] 恢复固定版。"
+        fi
+    else
+        echo -e "  版本策略: ${GREEN}跟随最新稳定版${NC}"
+    fi
+    echo ""
+    echo -e "    ${GREEN}[1]${NC} 安装/更新最新稳定版"
+    echo -e "    ${GREEN}[2]${NC} 安装固定版 v${SINGBOX_FIXED_VERSION}（安装后禁止升级）"
+    echo -e "    ${YELLOW}[0]${NC} 返回主菜单"
+    echo ""
+    read -r -p "  请选择 [0-2]: " choice
+    case "$choice" in
+        1)
+            if _singbox_core_is_locked; then
+                _error "当前核心已固定为 v${SINGBOX_FIXED_VERSION}，不允许升级到其他版本。"
+                _info "如需修复或重装，请选择 [2] 重新安装固定版。"
+                return 1
+            fi
+            _do_update_singbox latest
+            ;;
+        2)
+            if ! _singbox_core_is_locked; then
+                _warn "安装完成后，脚本将永久锁定 v${SINGBOX_FIXED_VERSION}，后续菜单不再允许核心升级。"
+                read -r -p "  确认安装并锁定固定版？(y/N): " confirm
+                [[ "$confirm" =~ ^[Yy]$ ]] || { _info "已取消固定版安装。"; return 0; }
+            fi
+            _do_update_singbox "$SINGBOX_FIXED_VERSION"
+            ;;
+        0) return 0 ;;
+        *) _error "无效输入，请选择 [0-2]。"; return 1 ;;
+    esac
 }
 
 _install_or_update_singbox() { _install_singbox "$@"; } # 别名兼容
 
-# 执行 sing-box 核心的安装
-_do_install_singbox() {
-    _info "--- 安装 Sing-box 核心 (v${SINGBOX_FIXED_VERSION}) ---"
+# 执行 sing-box 核心的安装/更新
+_do_update_singbox() {
+    local install_target="${1:-latest}"
+    if [ "$install_target" = "latest" ] && _singbox_core_is_locked; then
+        _error "固定版锁已启用，拒绝执行 sing-box 核心升级。"
+        return 1
+    fi
+    case "$install_target" in
+        latest|"$SINGBOX_FIXED_VERSION") ;;
+        *) _error "无效的 sing-box 安装目标: ${install_target}"; return 1 ;;
+    esac
+
+    _info "--- 安装/更新 Sing-box 核心 ---"
     _install_dependencies
-    if ! _install_sing_box "$SINGBOX_FIXED_VERSION"; then
-        _error "Sing-box 核心安装失败。"
+    if ! _install_sing_box "$install_target"; then
+        _error "Sing-box 核心安装/更新失败。"
         return 1
     fi
 
@@ -7303,19 +7349,25 @@ _do_install_singbox() {
         return 1
     fi
 
-    if ! _write_singbox_core_lock; then
-        _error "固定版本锁写入失败，正在恢复旧核心。"
-        _manage_service stop >/dev/null 2>&1 || true
-        _rollback_singbox_binary
-        if [ -x "$SINGBOX_BIN" ]; then _manage_service restart >/dev/null 2>&1 || true; fi
-        return 1
+    if [ "$install_target" = "$SINGBOX_FIXED_VERSION" ]; then
+        if ! _write_singbox_core_lock; then
+            _error "固定版本锁写入失败，正在恢复旧核心。"
+            _manage_service stop >/dev/null 2>&1 || true
+            _rollback_singbox_binary
+            if [ -x "$SINGBOX_BIN" ]; then _manage_service restart >/dev/null 2>&1 || true; fi
+            return 1
+        fi
+        _secure_state_permissions
     fi
-    _secure_state_permissions
     _commit_singbox_binary
-    _success "[主] 服务已使用固定核心 v${SINGBOX_FIXED_VERSION} 成功启动。"
+    if [ "$install_target" = "$SINGBOX_FIXED_VERSION" ]; then
+        _success "[主] 服务已使用固定核心 v${SINGBOX_FIXED_VERSION} 启动，版本升级锁已生效。"
+    else
+        _success "[主] 服务已使用最新稳定核心 v${SINGBOX_STAGED_VERSION:-未知} 启动，更新已提交。"
+    fi
 }
 
-_do_update_singbox() { _do_install_singbox "$@"; } # 别名兼容
+_do_install_singbox() { _do_update_singbox "$@"; } # 别名兼容
 
 # [安装/更新 Xray 核心] — 双模态：未装就装、已装就更新
 _install_or_update_xray() {
@@ -7757,7 +7809,7 @@ _main_menu() {
         
         # 核心管理
         echo -e "  ${CYAN}【核心管理】${NC}"
-        echo -e "    ${GREEN}[14]${NC} 安装 Sing-box 核心  ${GREEN}[15]${NC} 安装/更新 Xray 核心"
+        echo -e "    ${GREEN}[14]${NC} 安装/更新 Sing-box 核心  ${GREEN}[15]${NC} 安装/更新 Xray 核心"
         echo -e "    ${RED}[16]${NC} 卸载脚本"
         echo ""
         
