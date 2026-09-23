@@ -341,23 +341,47 @@ show_rules() {
         return
     fi
 
-    local lines=($(grep -n 'listen =' "$CONFIG_FILE"))
-    if [ ${#lines[@]} -eq 0 ]; then
-        echo -e "没有发现任何转发规则。"
-        return
-    fi
-
-    local index=1
-    for line in "${lines[@]}"; do
-        local line_number=$(echo "$line" | cut -d ':' -f 1)
-        local listen_info=$(sed -n "${line_number}p" "$CONFIG_FILE" | cut -d '"' -f 2)
-        local remote_info=$(sed -n "$((line_number + 1))p" "$CONFIG_FILE" | cut -d '"' -f 2)
-        local remark=$(sed -n "$((line_number - 1))p" "$CONFIG_FILE" | grep "^# 备注:" | cut -d ':' -f 2)
-        
-        printf "%-4s| %-24s| %-34s| %-20s\n" " $index" "$listen_info" "$remote_info" "$remark"
+    local count=0
+    while IFS=$'\t' read -r idx listen remote remark; do
+        [ -z "$idx" ] && continue
+        count=$((count + 1))
+        printf "%-4s| %-24s| %-34s| %-20s\n" " $idx" "$listen" "$remote" "$remark"
         echo -e "${BLUE}---------------------------------------------------------------------------------------------------------${NC}"
-        let index+=1
-    done
+    done <<EOF
+$(awk '
+BEGIN { in_ep=0; remark=""; listen=""; remote=""; idx=0 }
+/^\[\[endpoints\]\]/ {
+    if (in_ep && (listen != "" || remote != "")) {
+        idx++;
+        printf "%d\t%s\t%s\t%s\n", idx, listen, remote, remark;
+    }
+    in_ep=1; remark=""; listen=""; remote="";
+    next
+}
+in_ep {
+    if ($0 ~ /^#[[:space:]]*备注:/) {
+        sub(/^#[[:space:]]*备注:[[:space:]]*/, "");
+        remark = $0;
+    } else if ($0 ~ /^[[:space:]]*listen[[:space:]]*=/) {
+        match($0, /"[^"]+"/);
+        if (RSTART > 0) listen = substr($0, RSTART+1, RLENGTH-2);
+    } else if ($0 ~ /^[[:space:]]*remote[[:space:]]*=/) {
+        match($0, /"[^"]+"/);
+        if (RSTART > 0) remote = substr($0, RSTART+1, RLENGTH-2);
+    }
+}
+END {
+    if (in_ep && (listen != "" || remote != "")) {
+        idx++;
+        printf "%d\t%s\t%s\t%s\n", idx, listen, remote, remark;
+    }
+}
+' "$CONFIG_FILE")
+EOF
+
+    if [ "$count" -eq 0 ]; then
+        echo -e "没有发现任何转发规则。"
+    fi
 }
 
 # 添加转发规则
@@ -442,37 +466,17 @@ EOF
 
 # 删除转发规则
 delete_rule() {
-    echo -e "                   ${YELLOW}当前 Realm 转发规则${NC}                   "
-    echo -e "${BLUE}---------------------------------------------------------------------------------------------------------${NC}${YELLOW}"
-    printf "%-5s| %-30s| %-40s| %-20s\n" "序号" "   本地地址:端口 " "   目标地址:端口 " "备注"
-    echo -e "${NC}${BLUE}---------------------------------------------------------------------------------------------------------${NC}"
-    
+    show_rules
+
     if [ ! -f "$CONFIG_FILE" ]; then
-        echo "未找到配置文件。"
         return
     fi
 
-    local lines=($(grep -n '^\[\[endpoints\]\]' "$CONFIG_FILE"))
-    if [ ${#lines[@]} -eq 0 ]; then
-        echo "没有发现任何转发规则。"
+    local total
+    total=$(grep -c '^\[\[endpoints\]\]' "$CONFIG_FILE" 2>/dev/null || echo 0)
+    if [ "$total" -eq 0 ]; then
         return
     fi
-
-    local index=1
-    for line in "${lines[@]}"; do
-        local line_number=$(echo "$line" | cut -d ':' -f 1)
-        local remark_line=$((line_number + 1))
-        local listen_line=$((line_number + 2))
-        local remote_line=$((line_number + 3))
-
-        local remark=$(sed -n "${remark_line}p" "$CONFIG_FILE" | grep "^# 备注:" | cut -d ':' -f 2)
-        local listen_info=$(sed -n "${listen_line}p" "$CONFIG_FILE" | cut -d '"' -f 2)
-        local remote_info=$(sed -n "${remote_line}p" "$CONFIG_FILE" | cut -d '"' -f 2)
-
-        printf "%-4s| %-24s| %-34s| %-20s\n" " $index" "$listen_info" "$remote_info" "$remark"
-        echo -e "${BLUE}---------------------------------------------------------------------------------------------------------${NC}"
-        let index+=1
-    done
 
     echo "请输入要删除的转发规则序号，直接按回车返回主菜单。"
     read -rp "选择: " choice
@@ -481,35 +485,43 @@ delete_rule() {
         return
     fi
 
-    if ! [[ $choice =~ ^[0-9]+$ ]]; then
-        echo "无效输入，请输入数字。"
-        return
-    fi
-
-    if [ "$choice" -lt 1 ] || [ "$choice" -gt "${#lines[@]}" ]; then
+    if ! [[ $choice =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "$total" ]; then
         echo "选择超出范围，请输入有效序号。"
         return
     fi
 
-    local chosen_line=${lines[$((choice - 1))]}
-    local start_line=$(echo "$chosen_line" | cut -d ':' -f 1)
+    local tmp_file="${CONFIG_FILE}.tmp"
+    awk -v target="$choice" '
+    BEGIN { ep_count=0; in_target=0 }
+    /^\[\[endpoints\]\]/ {
+        ep_count++;
+        if (ep_count == target) {
+            in_target=1;
+            next;
+        } else {
+            in_target=0;
+        }
+    }
+    in_target {
+        if ($0 ~ /^\[\[endpoints\]\]/) {
+            in_target=0;
+        } else {
+            next;
+        }
+    }
+    {
+        print $0;
+    }
+    ' "$CONFIG_FILE" > "$tmp_file"
 
-    local next_endpoints_line=$(grep -n '^\[\[endpoints\]\]' "$CONFIG_FILE" | grep -A 1 "^$start_line:" | tail -n 1 | cut -d ':' -f 1)
-
-    local end_line
-    if [ -z "$next_endpoints_line" ] || [ "$next_endpoints_line" -le "$start_line" ]; then
-        end_line=$(wc -l < "$CONFIG_FILE")
-    else
-        end_line=$((next_endpoints_line - 1))
-    fi
-
-    sed -i "${start_line},${end_line}d" "$CONFIG_FILE"
+    mv -f "$tmp_file" "$CONFIG_FILE"
     sed -i '/^[[:space:]]*$/d' "$CONFIG_FILE"
 
     echo "转发规则及其备注已删除。"
     service_control restart >/dev/null
     echo -e "${GREEN}✔ 规则已删除，服务已重启生效！${NC}"
 }
+
 
 # 定时任务管理
 manage_cron() {
