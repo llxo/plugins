@@ -25,3 +25,18 @@ wget -N https://raw.githubusercontent.com/llxo/plugins/refs/heads/main/NAT/EZrea
 ```bash
 wget -q https://raw.githubusercontent.com/llxo/plugins/refs/heads/main/NAT/singbox-lite.sh -O /usr/local/bin/sb && chmod +x /usr/local/bin/sb && sb
 ```
+
+### 3. vless-enc.sh
+- **修改自**：[yahuisme/vless-encryption](https://github.com/yahuisme/vless-encryption)
+- **修改说明**：
+  - 新增 Alpine Linux 环境自检测与 apk 依赖自举支持；
+  - 自动适配 OpenRC (`/etc/init.d/xray`) 与 systemd 双 Init 服务管理系统；
+  - 完善 Xray 核心下载校验、服务生命周期管理、快照备份与回滚机制；
+  - 适配 Alpine/OpenRC 下的日志查看与服务状态展示。
+- **功能说明**：Xray VLESS Encryption 极简一键安装与管理脚本，支持 VLESS Encryption 及 VLESS Encryption + REALITY（XTLS Vision 流控与 ML-KEM-768 后量子认证），提供交互式菜单与非交互命令行参数。
+- **运行命令**：
+```bash
+wget -N https://raw.githubusercontent.com/llxo/plugins/refs/heads/main/NAT/vless-enc.sh && chmod +x vless-enc.sh && ./vless-enc.sh
+```
+
+

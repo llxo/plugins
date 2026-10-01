@@ -1,15 +1,41 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # ==============================================================================
 # Xray VLESS Encryption 极简一键安装脚本
-# 系统支持: Debian 10+ / Ubuntu 20.04+
+# 系统支持: Debian 10+ / Ubuntu 20.04+ / Alpine / CentOS / Fedora
 # 版本: v26.09.27
 # ==============================================================================
+
+# Alpine / Busybox 环境自检测与自举（若在 sh 下运行且没有 bash，自动安装 bash）
+if [ -z "${BASH_VERSION:-}" ]; then
+    if [ -f "$0" ]; then
+        if command -v bash >/dev/null 2>&1; then
+            exec bash "$0" "$@"
+        elif command -v apk >/dev/null 2>&1; then
+            echo "检测到 Alpine 系统未安装 bash，正在安装基础组件..."
+            apk update && apk add --no-cache bash curl ca-certificates
+            exec bash "$0" "$@"
+        else
+            echo "错误：当前环境缺少 bash，请先安装 bash 后再运行此脚本！"
+            exit 1
+        fi
+    else
+        if command -v apk >/dev/null 2>&1 && ! command -v bash >/dev/null 2>&1; then
+            echo "检测到 Alpine 系统未安装 bash，正在安装基础组件..."
+            apk update && apk add --no-cache bash curl ca-certificates
+        fi
+        echo "错误：请使用 bash 运行此脚本，例如: bash <(curl -sL ...) 或 bash $0"
+        exit 1
+    fi
+fi
 
 set -euo pipefail
 
 SCRIPT_VERSION="v26.09.27"
 XRAY_BIN="/usr/local/bin/xray"
 XRAY_CONFIG="/usr/local/etc/xray/config.json"
+XRAY_SHARE_DIR="/usr/local/share/xray"
+OPENRC_SERVICE_FILE="/etc/init.d/xray"
+SYSTEMD_SERVICE_FILE="/etc/systemd/system/xray.service"
 XRAY_INSTALL_URL="https://raw.githubusercontent.com/XTLS/Xray-install/e741a4f56d368afbb9e5be3361b40c4552d3710d/install-release.sh"
 XRAY_INSTALL_SHA256="7f70c95f6b418da8b4f4883343d602964915e28748993870fd554383afdbe555"
 ENCRYPTION_INFO="/root/xray_encryption_info.txt"
@@ -21,6 +47,7 @@ INSTALL_MODE=""
 REALITY_SHORT_ID_SET=false
 ROLLBACK_DIR=""
 INSTALL_ROLLBACK_DIR=""
+INIT_SYSTEM=""
 
 C_RESET='\033[0m'; C_BOLD='\033[1m'
 C_RED='\033[91m'; C_GREEN='\033[92m'; C_YELLOW='\033[93m'
@@ -55,16 +82,44 @@ error() {
 }
 section_title() { cecho "$C_MAGENTA$C_BOLD" "◆ $1" 1; }
 
+detect_init_system() {
+    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+        INIT_SYSTEM="systemd"
+    elif command -v rc-service >/dev/null 2>&1 || [ -f /sbin/openrc-run ] || [ -f /etc/alpine-release ]; then
+        INIT_SYSTEM="openrc"
+    elif command -v systemctl >/dev/null 2>&1; then
+        INIT_SYSTEM="systemd"
+    else
+        INIT_SYSTEM="openrc"
+    fi
+}
+detect_init_system
+
 require_root_and_dependencies() {
     [ "$(id -u)" = 0 ] || { error "必须以 root 用户运行此脚本。"; exit 1; }
+    detect_init_system
     local pm=""
-    if command -v apt-get >/dev/null 2>&1; then pm=apt
+    if command -v apk >/dev/null 2>&1; then pm=apk
+    elif command -v apt-get >/dev/null 2>&1; then pm=apt
     elif command -v dnf >/dev/null 2>&1; then pm=dnf
     elif command -v yum >/dev/null 2>&1; then pm=yum
-    else error "仅支持 apt、dnf 或 yum 系统。"; exit 1; fi
-    if ! command -v curl >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1 || ! command -v sha256sum >/dev/null 2>&1 || ! command -v pgrep >/dev/null 2>&1 || ! command -v ss >/dev/null 2>&1; then
+    else error "仅支持 apk、apt、dnf 或 yum 系统。"; exit 1; fi
+
+    local missing=false
+    for cmd in curl jq sha256sum pgrep ss; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            missing=true
+            break
+        fi
+    done
+    if [ "$pm" = apk ] && ! command -v unzip >/dev/null 2>&1; then
+        missing=true
+    fi
+
+    if [ "$missing" = true ]; then
         info "正在安装依赖与进程、端口检查工具..."
         case "$pm" in
+            apk) apk update && apk add --no-cache curl jq coreutils procps iproute2 ca-certificates unzip ;;
             apt) apt-get -o DPkg::Lock::Timeout=600 update && apt-get -o DPkg::Lock::Timeout=600 install -y curl jq coreutils procps iproute2 ;;
             dnf|yum) "$pm" install -y curl jq coreutils procps-ng iproute ;;
         esac
@@ -137,16 +192,18 @@ xray_supports() {
         grep -q 'Authentication: ML-KEM-768, Post-Quantum' <<< "$output"
 }
 service_account() {
-    local user group
-    user=$(systemctl show -p User --value xray 2>/dev/null || true)
-    group=$(systemctl show -p Group --value xray 2>/dev/null || true)
-    for service_file in /etc/systemd/system/xray.service /lib/systemd/system/xray.service /usr/lib/systemd/system/xray.service; do
-        [ -f "$service_file" ] || continue
-        [ -n "$user" ] || user=$(awk -F= '/^[[:space:]]*User=/{print $2; exit}' "$service_file")
-        [ -n "$group" ] || group=$(awk -F= '/^[[:space:]]*Group=/{print $2; exit}' "$service_file")
-    done
-    user=${user:-root}; group=${group:-$(id -gn "$user")}
-    id "$user" >/dev/null 2>&1 && getent group "$group" >/dev/null 2>&1 || return 1
+    local user group service_file
+    if [ "$INIT_SYSTEM" = "systemd" ]; then
+        user=$(systemctl show -p User --value xray 2>/dev/null || true)
+        group=$(systemctl show -p Group --value xray 2>/dev/null || true)
+        for service_file in /etc/systemd/system/xray.service /lib/systemd/system/xray.service /usr/lib/systemd/system/xray.service; do
+            [ -f "$service_file" ] || continue
+            [ -n "$user" ] || user=$(awk -F= '/^[[:space:]]*User=/{print $2; exit}' "$service_file")
+            [ -n "$group" ] || group=$(awk -F= '/^[[:space:]]*Group=/{print $2; exit}' "$service_file")
+        done
+    fi
+    user=${user:-root}; group=${group:-$(id -gn "$user" 2>/dev/null || echo "root")}
+    id "$user" >/dev/null 2>&1 || return 1
     printf '%s:%s\n' "$user" "$group"
 }
 
@@ -174,6 +231,140 @@ run_official_installer() {
         error "官方 Xray 安装程序执行失败，以下为末尾日志："
         tail -n 30 "$log_file" >&2 || true
         return "$rc"
+    fi
+}
+
+get_xray_arch() {
+    local arch
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64|amd64) echo "64" ;;
+        aarch64|arm64|armv8*) echo "arm64-v8a" ;;
+        armv7*|armhf) echo "arm32-v7a" ;;
+        i386|i686) echo "32" ;;
+        s390x) echo "s390x" ;;
+        riscv64) echo "riscv64" ;;
+        *) echo "" ;;
+    esac
+}
+
+setup_openrc_service() {
+    local tmp_svc
+    tmp_svc=$(mktemp /etc/init.d/.xray.XXXXXX) || return 1
+    cat > "$tmp_svc" << 'EOF'
+#!/sbin/openrc-run
+
+name="xray"
+description="Xray Service"
+command="/usr/local/bin/xray"
+command_args="run -c /usr/local/etc/xray/config.json"
+command_background="yes"
+pidfile="/run/xray.pid"
+output_log="/var/log/xray/access.log"
+error_log="/var/log/xray/error.log"
+
+depend() {
+    need net
+    after firewall
+}
+
+start_pre() {
+    checkpath -d -m 0755 /usr/local/etc/xray
+    checkpath -d -m 0755 /var/log/xray
+    checkpath -d -m 0755 /run
+}
+EOF
+    chmod 755 "$tmp_svc" && mv -f "$tmp_svc" "$OPENRC_SERVICE_FILE" || { rm -f "$tmp_svc"; return 1; }
+    rc-update add xray default 2>/dev/null || true
+}
+
+install_xray_openrc() {
+    local version="${1:-}" arch xray_arch download_url digest_url tmp_dir tmp_zip
+    xray_arch=$(get_xray_arch)
+    [ -n "$xray_arch" ] || { error "Xray 不支持当前系统架构: $(uname -m)"; return 1; }
+
+    if [ -n "$version" ]; then
+        download_url="https://github.com/XTLS/Xray-core/releases/download/v${version#v}/Xray-linux-${xray_arch}.zip"
+    else
+        download_url="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${xray_arch}.zip"
+    fi
+    digest_url="${download_url}.dgst"
+
+    tmp_dir=$(mktemp -d /tmp/.xray-install.XXXXXX) || return 1
+    tmp_zip="${tmp_dir}/xray.zip"
+    trap 'rm -rf -- "${tmp_dir:-}"' RETURN
+
+    if ! curl --fail --silent --show-error --location --connect-timeout 10 --max-time 120 "$download_url" > "$tmp_zip"; then
+        error "下载 Xray 核心失败。"; return 1
+    fi
+
+    if curl --fail --silent --location --connect-timeout 5 --max-time 30 "$digest_url" > "${tmp_zip}.dgst" 2>/dev/null; then
+        local expected actual
+        expected=$(awk -F'= *' 'toupper($1) == "SHA2-256" || toupper($1) == "SHA256" {print $2; exit}' "${tmp_zip}.dgst" | tr -d ' \r\n')
+        if [ -n "$expected" ]; then
+            actual=$(sha256sum "$tmp_zip" | awk '{print $1}')
+            if [ -n "$actual" ] && [ "${expected,,}" != "${actual,,}" ]; then
+                error "Xray 安装包 SHA-256 校验失败，已拒绝安装。"; return 1
+            fi
+        fi
+    fi
+
+    if ! unzip -p "$tmp_zip" xray > "${tmp_dir}/xray"; then
+        error "解压 Xray 二进制失败。"; return 1
+    fi
+    chmod 755 "${tmp_dir}/xray" || return 1
+    "${tmp_dir}/xray" version >/dev/null 2>&1 || { error "下载的 Xray 核心无法执行。"; return 1; }
+
+    install -d -m 0755 /usr/local/bin || return 1
+    install -d -m 0755 /usr/local/share/xray || return 1
+    install -d -m 0755 /usr/local/etc/xray || return 1
+    install -d -m 0755 /var/log/xray || return 1
+
+    mv -f "${tmp_dir}/xray" "$XRAY_BIN" || return 1
+    chmod 755 "$XRAY_BIN" || return 1
+
+    for geodata in geoip.dat geosite.dat; do
+        if unzip -p "$tmp_zip" "$geodata" > "${tmp_dir}/$geodata" 2>/dev/null; then
+            mv -f "${tmp_dir}/$geodata" "${XRAY_SHARE_DIR}/$geodata" || true
+            chmod 644 "${XRAY_SHARE_DIR}/$geodata" 2>/dev/null || true
+        fi
+    done
+
+    setup_openrc_service || return 1
+    return 0
+}
+
+install_geodata_openrc() {
+    install -d -m 0755 "${XRAY_SHARE_DIR}" || return 1
+    local geo url ok=true
+    for geo in geoip.dat geosite.dat; do
+        url="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/${geo}"
+        if curl --fail --silent --show-error --location --connect-timeout 10 --max-time 60 "$url" -o "${XRAY_SHARE_DIR}/${geo}.tmp"; then
+            mv -f "${XRAY_SHARE_DIR}/${geo}.tmp" "${XRAY_SHARE_DIR}/${geo}"
+            chmod 644 "${XRAY_SHARE_DIR}/${geo}"
+        else
+            rm -f "${XRAY_SHARE_DIR}/${geo}.tmp"
+            ok=false
+        fi
+    done
+    [ -f "${XRAY_SHARE_DIR}/geoip.dat" ] && [ -f "${XRAY_SHARE_DIR}/geosite.dat" ] && return 0
+    [ "$ok" = true ] || { error "下载 GeoIP / GeoSite 数据失败。"; return 1; }
+    return 0
+}
+
+install_xray_core() {
+    if [ "$INIT_SYSTEM" = "systemd" ]; then
+        run_official_installer install --without-geodata "$@"
+    else
+        install_xray_openrc
+    fi
+}
+
+install_xray_geodata() {
+    if [ "$INIT_SYSTEM" = "systemd" ]; then
+        run_official_installer install-geodata
+    else
+        install_geodata_openrc
     fi
 }
 
@@ -278,7 +469,7 @@ generate_reality_keys() {
 
 write_config() {
     local port="$1" uuid="$2" decryption="$3" encryption="$4" mode="$5" private="${6:-}" public="${7:-}" sni="${8:-}" short_id="${9:-}"
-    local tmp account user group enc_tmp reality_tmp test_log snapshot merged
+    local tmp_dir tmp account user group enc_tmp reality_tmp test_log snapshot merged
     local preserve="${10:-false}"
     if [ -n "$ROLLBACK_DIR" ] && [ -d "$ROLLBACK_DIR" ]; then
         error "存在未完成恢复，请先处理快照：$ROLLBACK_DIR"; return 1
@@ -287,20 +478,23 @@ write_config() {
     if [ "$mode" = reality ]; then
         validate_reality_key "$private" && validate_reality_key "$public" && valid_sni "$sni" && valid_short_id "$short_id" || return 1
     fi
-    account=$(service_account) || { error "无法确定 Xray systemd 服务账户。"; return 1; }
+    account=$(service_account) || { error "无法确定 Xray 服务账户。"; return 1; }
     user=${account%%:*}; group=${account#*:}
     install -d -m 0755 "$(dirname "$XRAY_CONFIG")" || return 1
-    tmp=$(mktemp "${XRAY_CONFIG}.tmp.XXXXXX.json") || return 1
-    chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
+    tmp_dir=$(mktemp -d /tmp/xray-cfg.XXXXXX) || return 1
+    tmp="$tmp_dir/config.json"
+    trap 'rm -rf -- "${tmp_dir:-}"' RETURN
+    chmod 700 "$tmp_dir" || return 1
     if [ "$mode" = reality ]; then
         jq -n --argjson port "$port" --arg uuid "$uuid" --arg decryption "$decryption" --arg private "$private" --arg sni "$sni" --arg sid "$short_id" '
-          {log:{loglevel:"warning"},inbounds:[{listen:"::",port:$port,protocol:"vless",settings:{clients:[{id:$uuid,flow:"xtls-rprx-vision"}],decryption:$decryption},streamSettings:{network:"tcp",security:"reality",realitySettings:{show:false,dest:($sni+":443"),xver:0,serverNames:[$sni],privateKey:$private,shortIds:[$sid]}}}],outbounds:[{protocol:"freedom",settings:{domainStrategy:"UseIPv4v6"}}]}' > "$tmp" || { rm -f "$tmp"; return 1; }
+          {log:{loglevel:"warning"},inbounds:[{listen:"::",port:$port,protocol:"vless",settings:{clients:[{id:$uuid,flow:"xtls-rprx-vision"}],decryption:$decryption},streamSettings:{network:"tcp",security:"reality",realitySettings:{show:false,dest:($sni+":443"),xver:0,serverNames:[$sni],privateKey:$private,shortIds:[$sid]}}}],outbounds:[{protocol:"freedom",settings:{domainStrategy:"UseIPv4v6"}}]}' > "$tmp" || return 1
     else
         jq -n --argjson port "$port" --arg uuid "$uuid" --arg decryption "$decryption" '
-          {log:{loglevel:"warning"},inbounds:[{listen:"::",port:$port,protocol:"vless",settings:{clients:[{id:$uuid,flow:"xtls-rprx-vision"}],decryption:$decryption}}],outbounds:[{protocol:"freedom",settings:{domainStrategy:"UseIPv4v6"}}]}' > "$tmp" || { rm -f "$tmp"; return 1; }
+          {log:{loglevel:"warning"},inbounds:[{listen:"::",port:$port,protocol:"vless",settings:{clients:[{id:$uuid,flow:"xtls-rprx-vision"}],decryption:$decryption}}],outbounds:[{protocol:"freedom",settings:{domainStrategy:"UseIPv4v6"}}]}' > "$tmp" || return 1
     fi
+    chmod 600 "$tmp" || return 1
     if [ "$preserve" = true ]; then
-        merged=$(mktemp "${XRAY_CONFIG}.tmp.XXXXXX.json") || { rm -f "$tmp"; return 1; }
+        merged="$tmp_dir/merged.json"
         # Only update owned parameters; preserve listeners, clients and user extensions.
         if ! jq --slurpfile new "$tmp" '
           .inbounds[0] |= (
@@ -324,40 +518,38 @@ write_config() {
                 .streamSettings |= (del(.realitySettings) | .security = "none")
               else . end
             end)' "$XRAY_CONFIG" > "$merged"; then
-            rm -f "$tmp" "$merged"; return 1
+            return 1
         fi
-        mv -f "$merged" "$tmp" || { rm -f "$tmp" "$merged"; return 1; }
+        mv -f "$merged" "$tmp" || return 1
     fi
-    test_log=$(mktemp) || { rm -f "$tmp"; return 1; }
-    chmod 600 "$test_log" || { rm -f "$tmp" "$test_log"; return 1; }
+    test_log="$tmp_dir/test.log"
     if ! "$XRAY_BIN" run -test -config "$tmp" >"$test_log" 2>&1; then
-        error "Xray 配置校验失败，未替换现有配置。"; sed -n '1,40p' "$test_log" >&2 || true; rm -f "$tmp" "$test_log"; return 1
+        error "Xray 配置校验失败，未替换现有配置。"; sed -n '1,40p' "$test_log" >&2 || true; return 1
     fi
-    rm -f "$test_log"
-    snapshot=$(mktemp -d /tmp/xray-rollback.XXXXXX) || { rm -f "$tmp"; return 1; }
+    snapshot=$(mktemp -d /tmp/xray-rollback.XXXXXX) || return 1
     if ! chmod 700 "$snapshot" ||
        ! { [ ! -f "$XRAY_CONFIG" ] || cp -p "$XRAY_CONFIG" "$snapshot/config.json"; } ||
        ! { [ ! -f "$ENCRYPTION_INFO" ] || cp -p "$ENCRYPTION_INFO" "$snapshot/encryption.info"; } ||
        ! { [ ! -f "$REALITY_INFO" ] || cp -p "$REALITY_INFO" "$snapshot/reality.info"; }; then
-        rm -rf "$snapshot"; rm -f "$tmp"
+        rm -rf "$snapshot"
         error "无法创建配置快照，未替换现有配置。"; return 1
     fi
     ROLLBACK_DIR="$snapshot"
-    enc_tmp=$(mktemp "${ENCRYPTION_INFO}.tmp.XXXXXX") || { rm -f "$tmp"; return 1; }
+    enc_tmp=$(mktemp "${ENCRYPTION_INFO}.tmp.XXXXXX") || return 1
     if ! chmod 600 "$enc_tmp" || ! printf '%s\n' "$encryption" > "$enc_tmp"; then
-        rm -f "$tmp" "$enc_tmp"; return 1
+        rm -f "$enc_tmp"; return 1
     fi
     if [ "$mode" = reality ]; then
-        reality_tmp=$(mktemp "${REALITY_INFO}.tmp.XXXXXX") || { rm -f "$tmp" "$enc_tmp"; return 1; }
+        reality_tmp=$(mktemp "${REALITY_INFO}.tmp.XXXXXX") || { rm -f "$enc_tmp"; return 1; }
         if ! chmod 600 "$reality_tmp" || ! printf '%s|%s|%s\n' "$public" "$sni" "$short_id" > "$reality_tmp"; then
-            rm -f "$tmp" "$enc_tmp" "$reality_tmp"; return 1
+            rm -f "$enc_tmp" "$reality_tmp"; return 1
         fi
     else
         reality_tmp=""
     fi
     if ! mv -f "$tmp" "$XRAY_CONFIG" || ! chmod 600 "$XRAY_CONFIG" || ! chown "$user:$group" "$XRAY_CONFIG"; then
         error "替换 Xray 配置失败，正在恢复旧配置。"
-        rm -f "$tmp" "$enc_tmp" "$reality_tmp"
+        rm -f "$enc_tmp" "$reality_tmp"
         rollback_config
         return 1
     fi
@@ -504,6 +696,44 @@ prompt_default() {
     if color_enabled 2; then printf '%b%s%b' "$C_CYAN" "$1" "$C_RESET"; else printf '%s' "$1"; fi
 }
 
+is_xray_active() {
+    if [ "$INIT_SYSTEM" = "systemd" ]; then
+        systemctl is-active --quiet xray 2>/dev/null
+    elif [ "$INIT_SYSTEM" = "openrc" ]; then
+        if command -v rc-service >/dev/null 2>&1; then
+            rc-service xray status 2>/dev/null | grep -q "status: started"
+        else
+            [ -n "$(xray_pids 2>/dev/null)" ]
+        fi
+    else
+        [ -n "$(xray_pids 2>/dev/null)" ]
+    fi
+}
+
+stop_xray_service() {
+    if [ "$INIT_SYSTEM" = "systemd" ]; then
+        systemctl stop xray 2>/dev/null || true
+    elif [ "$INIT_SYSTEM" = "openrc" ]; then
+        rc-service xray stop 2>/dev/null || true
+    fi
+}
+
+disable_xray_service() {
+    if [ "$INIT_SYSTEM" = "systemd" ]; then
+        systemctl disable xray 2>/dev/null || true
+    elif [ "$INIT_SYSTEM" = "openrc" ]; then
+        rc-update del xray default 2>/dev/null || true
+    fi
+}
+
+restart_xray_service_cmd() {
+    if [ "$INIT_SYSTEM" = "systemd" ]; then
+        systemctl restart xray
+    elif [ "$INIT_SYSTEM" = "openrc" ]; then
+        rc-service xray restart 2>/dev/null || rc-service xray start
+    fi
+}
+
 xray_status_line() {
     local version mode
     if [ ! -x "$XRAY_BIN" ]; then
@@ -513,7 +743,7 @@ xray_status_line() {
     version=$("$XRAY_BIN" version 2>/dev/null | awk 'NR==1{print $2}' || true)
     version=${version:-未知}
     local state_text state_color
-    if systemctl is-active --quiet xray 2>/dev/null; then
+    if is_xray_active; then
         state_text="运行中"; state_color="$C_GREEN"
     else
         state_text="未运行"; state_color="$C_YELLOW"
@@ -571,7 +801,8 @@ has_xray_residue() {
     for path in "$XRAY_BIN" "$XRAY_CONFIG" "$ENCRYPTION_INFO" "$REALITY_INFO" "$SUBSCRIPTION_INFO" \
         /usr/local/etc/xray /usr/local/share/xray /var/log/xray \
         /etc/systemd/system/xray.service /etc/systemd/system/xray@.service \
-        /etc/systemd/system/xray.service.d /etc/systemd/system/xray@.service.d; do
+        /etc/systemd/system/xray.service.d /etc/systemd/system/xray@.service.d \
+        /etc/init.d/xray /run/xray.pid; do
         if [ -e "$path" ] || [ -L "$path" ]; then return 0; fi
     done
     pids=$(xray_pids) || return 0
@@ -585,35 +816,36 @@ uninstall_xray() {
         return 0
     fi
     echo
-    cecho "$C_YELLOW" "  即将卸载 Xray，并使用官方 --purge 清除 Xray 的全部配置和文件。"
+    cecho "$C_YELLOW" "  即将卸载 Xray，并清除 Xray 的全部配置和文件。"
     cecho "$C_YELLOW" "  这不仅限于本脚本生成的文件；成功后还会删除本脚本，操作不可恢复。"
     read -r -p "  确定继续？[y/N]: " confirm || { error "读取确认失败，已取消卸载。"; return 2; }
     if [[ ! "$confirm" =~ ^[yY]$ ]]; then info "已取消卸载。"; return 0; fi
     print_step 1 3 "正在停止并卸载 Xray..."
-    if [ -f /etc/systemd/system/xray.service ] || systemctl is-active --quiet xray; then
-        systemctl stop xray || { error "停止 Xray 失败，已中止卸载。"; return 1; }
-        systemctl disable xray || { error "禁用 Xray 失败，已中止卸载。"; return 1; }
-    fi
+    stop_xray_service
+    disable_xray_service
     stop_xray_processes || { error "无法确认 Xray 残留进程已停止，已中止卸载。"; return 1; }
-    if [[ -f "$XRAY_BIN" && -d "$(dirname "$XRAY_CONFIG")" &&
+    if [ "$INIT_SYSTEM" = "systemd" ] && [[ -f "$XRAY_BIN" && -d "$(dirname "$XRAY_CONFIG")" &&
           -f /etc/systemd/system/xray.service && -f /etc/systemd/system/xray@.service &&
           -d /etc/systemd/system/xray.service.d && -d /etc/systemd/system/xray@.service.d ]]; then
         if ! run_official_installer remove --purge; then error "Xray 卸载失败。"; return 1; fi
     else
-        info "安装文件不完整，仅清理残留。"
+        info "正在清理安装文件与残留..."
     fi
     print_step 2 3 "正在清除配置和客户端信息..."
     if ! rm -rf /usr/local/etc/xray /usr/local/share/xray /var/log/xray \
             /etc/systemd/system/xray.service.d /etc/systemd/system/xray@.service.d ||
        ! rm -f "$XRAY_BIN" /etc/systemd/system/xray.service /etc/systemd/system/xray@.service \
+            /etc/init.d/xray /run/xray.pid \
             "$ENCRYPTION_INFO" "$REALITY_INFO" "$SUBSCRIPTION_INFO"; then
         error "残留文件清理失败，保留本脚本以便重试。"; return 1
     fi
-    systemctl daemon-reload || { error "systemd 重载失败。"; return 1; }
+    if [ "$INIT_SYSTEM" = "systemd" ] && command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload 2>/dev/null || { error "systemd 重载失败。"; return 1; }
+    fi
     print_step 3 3 "正在确认卸载结果..."
     stop_xray_processes || { error "仍有 Xray 残留进程。"; return 1; }
-    if [ -e "$XRAY_BIN" ] || systemctl list-unit-files --no-legend 2>/dev/null | awk '{print $1}' | grep -qx 'xray.service'; then
-        error "仍检测到 Xray 文件或服务，请使用菜单 5 查看日志。"
+    if [ -e "$XRAY_BIN" ] || [ -f /etc/init.d/xray ] || { [ "$INIT_SYSTEM" = "systemd" ] && systemctl list-unit-files --no-legend 2>/dev/null | awk '{print $1}' | grep -qx 'xray.service'; }; then
+        error "仍检测到 Xray 文件或服务，请检查环境。"
         return 1
     fi
     # 官方 --purge 不会删除本脚本及脚本生成在 /root 下的文件。
@@ -639,6 +871,7 @@ rollback_config() {
     success "配置回滚完成。"
 }
 clear_rollback() { [ -z "$ROLLBACK_DIR" ] || { rm -rf "$ROLLBACK_DIR" || return 1; ROLLBACK_DIR=""; }; }
+
 begin_install_snapshot() {
     local dir geo
     if { [ -n "$INSTALL_ROLLBACK_DIR" ] && [ -d "$INSTALL_ROLLBACK_DIR" ]; } ||
@@ -659,25 +892,31 @@ begin_install_snapshot() {
             rm -rf "$dir"; return 1
         fi
     done
-    if systemctl is-active --quiet xray; then
+    if is_xray_active; then
         touch "$dir/was-active" || { rm -rf "$dir"; return 1; }
     fi
     if [ -f /etc/systemd/system/xray.service ]; then
         cp -p /etc/systemd/system/xray.service "$dir/xray.service" || { rm -rf "$dir"; return 1; }
     fi
+    if [ -f /etc/init.d/xray ]; then
+        cp -p /etc/init.d/xray "$dir/xray.initd" || { rm -rf "$dir"; return 1; }
+    fi
     INSTALL_ROLLBACK_DIR="$dir"
 }
+
 restore_install_snapshot() {
     if [ -z "$INSTALL_ROLLBACK_DIR" ] || [ ! -d "$INSTALL_ROLLBACK_DIR" ]; then return 0; fi
     error "正在恢复安装前的配置和 Xray 核心..."
     local failed=false geo fresh=false
-    [ -f "$INSTALL_ROLLBACK_DIR/xray.service" ] || fresh=true
-    if [ -f /etc/systemd/system/xray.service ] || systemctl is-active --quiet xray; then
-        if ! systemctl stop xray; then
-            error "停止 Xray 失败，未覆盖文件；快照保留在 $INSTALL_ROLLBACK_DIR"; return 1
-        fi
-        if [ "$fresh" = true ] && ! systemctl disable --now xray; then
-            error "禁用 Xray 失败，未覆盖文件；快照保留在 $INSTALL_ROLLBACK_DIR"; return 1
+    if [ "$INIT_SYSTEM" = "systemd" ]; then
+        [ -f "$INSTALL_ROLLBACK_DIR/xray.service" ] || fresh=true
+    else
+        [ -f "$INSTALL_ROLLBACK_DIR/xray.initd" ] || fresh=true
+    fi
+    if is_xray_active || [ -f /etc/systemd/system/xray.service ] || [ -f /etc/init.d/xray ]; then
+        stop_xray_service
+        if [ "$fresh" = true ]; then
+            disable_xray_service
         fi
     fi
     if ! stop_xray_processes; then
@@ -700,7 +939,14 @@ restore_install_snapshot() {
         rm -f /etc/systemd/system/xray.service /etc/systemd/system/xray@.service || failed=true
         rm -rf /etc/systemd/system/xray.service.d /etc/systemd/system/xray@.service.d || failed=true
     fi
-    systemctl daemon-reload || failed=true
+    if [ -f "$INSTALL_ROLLBACK_DIR/xray.initd" ]; then
+        cp -p "$INSTALL_ROLLBACK_DIR/xray.initd" /etc/init.d/xray || failed=true
+    elif [ ! -f "$INSTALL_ROLLBACK_DIR/xray" ]; then
+        rm -f /etc/init.d/xray || failed=true
+    fi
+    if [ "$INIT_SYSTEM" = "systemd" ] && command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload 2>/dev/null || failed=true
+    fi
     if [ "$failed" = false ] && [ -f "$INSTALL_ROLLBACK_DIR/was-active" ] && [ -x "$INSTALL_ROLLBACK_DIR/xray" ]; then
         restart_xray || failed=true
     fi
@@ -711,16 +957,19 @@ restore_install_snapshot() {
     success "安装回滚完成。"
 }
 clear_install_snapshot() { [ -z "$INSTALL_ROLLBACK_DIR" ] || { rm -rf "$INSTALL_ROLLBACK_DIR" || return 1; INSTALL_ROLLBACK_DIR=""; }; }
+
 update_xray() {
-    [ -f /etc/systemd/system/xray.service ] || { error "主服务文件缺失，请先恢复 /etc/systemd/system/xray.service。"; return 1; }
+    if [ "$INIT_SYSTEM" = "systemd" ]; then
+        [ -f /etc/systemd/system/xray.service ] || { error "主服务文件缺失，请先恢复 /etc/systemd/system/xray.service。"; return 1; }
+    elif [ "$INIT_SYSTEM" = "openrc" ]; then
+        [ -f /etc/init.d/xray ] || { error "主服务文件缺失，请先恢复 /etc/init.d/xray。"; return 1; }
+    fi
     begin_install_snapshot || { error "无法创建更新回滚快照。"; return 1; }
-    # --without-geodata: 官方 install 默认已含 geodata 下载，与下方
-    # install-geodata 重复；统一由 install-geodata 负责。
-    if ! run_official_installer install --without-geodata --no-update-service; then
+    if ! install_xray_core --no-update-service; then
         error "Xray 更新失败，正在回滚。"
-    elif ! run_official_installer install-geodata; then
+    elif ! install_xray_geodata; then
         error "GeoIP/GeoSite 更新失败，正在回滚。"
-    elif ! { if [ -f "$INSTALL_ROLLBACK_DIR/was-active" ]; then restart_xray; else systemctl stop xray; fi; }; then
+    elif ! { if [ -f "$INSTALL_ROLLBACK_DIR/was-active" ]; then restart_xray; else stop_xray_service; fi; }; then
         error "恢复 Xray 运行状态失败，正在回滚。"
     else
         clear_install_snapshot
@@ -730,17 +979,26 @@ update_xray() {
     restore_install_snapshot || return 1
     return 1
 }
+
 abort_install() {
     restore_install_snapshot || return 1
     clear_rollback
     return 1
 }
 uri_encode() { jq -nr --arg value "$1" '$value | @uri'; }
+
 xray_main_pid() {
-    local pid exe
-    pid=$(systemctl show xray --property=MainPID --value) || return 1
+    local pid='' exe=''
+    if [ "$INIT_SYSTEM" = "systemd" ]; then
+        pid=$(systemctl show xray --property=MainPID --value 2>/dev/null || true)
+    elif [ -f "/run/xray.pid" ]; then
+        pid=$(cat /run/xray.pid 2>/dev/null || true)
+    fi
+    if [ -z "$pid" ] || [[ ! "$pid" =~ ^[1-9][0-9]*$ ]]; then
+        pid=$(xray_pids 2>/dev/null | head -n 1 || true)
+    fi
     [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
-    exe=$(readlink "/proc/$pid/exe") || return 1
+    exe=$(readlink "/proc/$pid/exe" 2>/dev/null) || return 1
     [[ "$exe" = "$XRAY_BIN" || "$exe" = "$XRAY_BIN (deleted)" ]] || return 1
     printf '%s\n' "$pid"
 }
@@ -748,15 +1006,15 @@ xray_main_pid() {
 restart_xray() {
     info "正在重启 Xray 服务..."
     local pid='' observed attempt stable=false
-    if systemctl restart xray; then
+    if restart_xray_service_cmd; then
         for ((attempt=0; attempt<5; attempt++)); do
-            if systemctl is-active --quiet xray && pid=$(xray_main_pid); then stable=true; break; fi
+            if is_xray_active && pid=$(xray_main_pid 2>/dev/null); then stable=true; break; fi
             sleep 1
         done
         if [ "$stable" = true ]; then
             for ((attempt=0; attempt<3; attempt++)); do
                 sleep 1
-                if ! systemctl is-active --quiet xray || ! observed=$(xray_main_pid) || [ "$pid" != "$observed" ]; then
+                if ! is_xray_active || ! observed=$(xray_main_pid 2>/dev/null) || [ "$pid" != "$observed" ]; then
                     stable=false; break
                 fi
             done
@@ -772,26 +1030,28 @@ install_selected() {
     local total=4 path
     local -a service_args=()
     [ "$mode" != reality ] || total=5
-    if [ -f /etc/systemd/system/xray.service ]; then
-        service_args=(--no-update-service)
-    else
-        # 官方在主 unit 缺失时忽略 --no-update-service；拒绝覆盖残留服务定义。
-        for path in "$XRAY_BIN" "$XRAY_CONFIG" \
-            /etc/systemd/system/xray.service /etc/systemd/system/xray@.service \
-            /etc/systemd/system/xray.service.d /etc/systemd/system/xray@.service.d \
-            /lib/systemd/system/xray.service /usr/lib/systemd/system/xray.service; do
-            if [ -e "$path" ] || [ -L "$path" ]; then
-                error "检测到既有安装但主服务文件缺失，请先恢复 /etc/systemd/system/xray.service。"; return 1
-            fi
-        done
+    if [ "$INIT_SYSTEM" = "systemd" ]; then
+        if [ -f /etc/systemd/system/xray.service ]; then
+            service_args=(--no-update-service)
+        else
+            # 官方在主 unit 缺失时忽略 --no-update-service；拒绝覆盖残留服务定义。
+            for path in "$XRAY_BIN" "$XRAY_CONFIG" \
+                /etc/systemd/system/xray.service /etc/systemd/system/xray@.service \
+                /etc/systemd/system/xray.service.d /etc/systemd/system/xray@.service.d \
+                /lib/systemd/system/xray.service /usr/lib/systemd/system/xray.service; do
+                if [ -e "$path" ] || [ -L "$path" ]; then
+                    error "检测到既有安装但主服务文件缺失，请先恢复 /etc/systemd/system/xray.service。"; return 1
+                fi
+            done
+        fi
     fi
     begin_install_snapshot || { error "无法创建安装回滚快照。"; return 1; }
     print_step 1 "$total" "正在安装 / 更新 Xray 核心..."
     # --without-geodata: 官方 install 默认已含 geodata 下载，与下方
     # install-geodata 重复；统一由 install-geodata 负责。
-    run_official_installer install --without-geodata "${service_args[@]}" || { error "Xray 核心安装失败。"; abort_install; return 1; }
+    install_xray_core "${service_args[@]}" || { error "Xray 核心安装失败。"; abort_install; return 1; }
     print_step 2 "$total" "正在更新 GeoIP 和 GeoSite 数据..."
-    run_official_installer install-geodata || { error "Geo 数据更新失败。"; abort_install; return 1; }
+    install_xray_geodata || { error "Geo 数据更新失败。"; abort_install; return 1; }
     print_step 3 "$total" "正在生成 VLESS Encryption 密钥材料..."
     xray_supports || { error "已安装的 Xray 不支持 VLESS Encryption。"; abort_install; return 1; }
     pair=$(generate_encryption_pair) || { abort_install; return 1; }; IFS='|' read -r dec enc <<< "$pair"
@@ -987,7 +1247,19 @@ main_menu() {
                 ;;
             3) ( restart_xray ) || true ;;
             4) ( uninstall_xray ) || true ;;
-            5) journalctl -u xray -f --no-pager || true ;;
+            5)
+                if [ "$INIT_SYSTEM" = "systemd" ] && command -v journalctl >/dev/null 2>&1; then
+                    journalctl -u xray -f --no-pager || true
+                elif [ -f /var/log/xray/error.log ] || [ -f /var/log/xray/access.log ]; then
+                    tail -f /var/log/xray/*.log 2>/dev/null || true
+                elif [ -f /var/log/xray.log ]; then
+                    tail -f /var/log/xray.log 2>/dev/null || true
+                elif [ -f /var/log/messages ]; then
+                    grep -i xray /var/log/messages | tail -n 50 || true
+                else
+                    rc-service xray status || true
+                fi
+                ;;
             6) modify_config || true ;;
             7) ( show_subscription ) || true ;;
             0) success "感谢使用。"; return ;;
