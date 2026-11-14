@@ -39,4 +39,27 @@ wget -q https://raw.githubusercontent.com/llxo/plugins/refs/heads/main/NAT/singb
 wget -N https://raw.githubusercontent.com/llxo/plugins/refs/heads/main/NAT/vless-enc.sh && chmod +x vless-enc.sh && ./vless-enc.sh
 ```
 
+### 4. singbox-anytls.sh
+- **功能说明**：sing-box AnyTLS 一键部署与管理脚本（兼容 systemd / OpenRC / direct，支持自签证书指纹、SS 落地节点与 1 对 1 中转，安装后自动创建 `sb` 快捷命令）。
+- **常用子命令**：
+  - `sb`：进入交互式管理菜单
+  - `sb info` / `sb url [筛选]`：查看节点信息与分享链接（支持按序号、端口或名称筛选）
+  - `sb status` / `start` / `stop` / `restart`：服务状态与启停控制
+  - `sb log [-f] [行数]`：查看运行日志（`-f` 实时跟踪）
+  - `sb fix`：校验并修复 `config.json`、`metadata.json`、缺失证书及服务配置
+  - `sb update` / `sb help`：更新核心 / 查看帮助
+  - `./singbox-anytls.sh -auto [port] [sni] [password]`：一键部署 AnyTLS 节点
+  - `./singbox-anytls.sh -ss2022 [port] [password] [name]`：一键部署 SS2022 落地节点
+- **运行命令**：
+```bash
+# 交互式菜单
+wget -N https://raw.githubusercontent.com/llxo/plugins/refs/heads/main/NAT/singbox-anytls.sh && chmod +x singbox-anytls.sh && ./singbox-anytls.sh
+
+# 一键自动部署 AnyTLS 节点 (可选参数: [port] [sni] [password])
+wget -N https://raw.githubusercontent.com/llxo/plugins/refs/heads/main/NAT/singbox-anytls.sh && chmod +x singbox-anytls.sh && ./singbox-anytls.sh -auto
+
+# 一键自动部署 SS2022 落地节点 (可选参数: [port] [password] [name])
+wget -N https://raw.githubusercontent.com/llxo/plugins/refs/heads/main/NAT/singbox-anytls.sh && chmod +x singbox-anytls.sh && ./singbox-anytls.sh -ss2022
+```
+
 
